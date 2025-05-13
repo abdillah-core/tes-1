@@ -1,116 +1,88 @@
-
 import streamlit as st
 import pandas as pd
+from io import BytesIO
 import re
-from datetime import datetime, timedelta
 
-st.title("Compare Rekening Koran vs Invoice - Output 10 Kolom Final")
+st.title("Perbandingan Transaksi Harian: Invoice vs Rekening Koran (Unit E-Channel > 100jt)")
 
-# --- Input Periode Rekonsiliasi ---
-st.header("Periode Rekonsiliasi")
-start_date = st.date_input("Tanggal Mulai")
-end_date = st.date_input("Tanggal Selesai")
+# Upload dua file Excel
+file_rekening = st.file_uploader("Upload Data 1 - Rekening Koran (Excel)", type=["xls", "xlsx"])
+file_invoice = st.file_uploader("Upload Data 2 - Invoice (Excel)", type=["xls", "xlsx"])
 
-# --- Upload File Rekening Koran ---
-st.header("Upload Rekening Koran (Data 1)")
-file1 = st.file_uploader("Upload Excel Rekening Koran", type=["xls", "xlsx"], key="file1")
+if file_rekening and file_invoice:
+    # Load data
+    rekening_df = pd.read_excel(file_rekening)
+    invoice_df = pd.read_excel(file_invoice)
 
-# --- Upload File Invoice ---
-st.header("Upload Invoice (Data 2)")
-file2 = st.file_uploader("Upload Excel Invoice", type=["xls", "xlsx"], key="file2")
+    # Format dan parsing tanggal
+    rekening_df['Post Date'] = pd.to_datetime(rekening_df['Post Date'], dayfirst=True, errors='coerce').dt.date
+    invoice_df['TANGGAL INVOICE'] = pd.to_datetime(invoice_df['TANGGAL INVOICE'], errors='coerce')
 
-def translate_bulan(text):
-    bulan_map = {
-        "JAN": "JAN", "FEB": "FEB", "MAR": "MAR", "APR": "APR", "MEI": "MAY",
-        "JUN": "JUN", "JUL": "JUL", "AGU": "AUG", "SEP": "SEP", "OKT": "OCT",
-        "NOV": "NOV", "DES": "DEC"
-    }
-    for indo, eng in bulan_map.items():
-        text = text.replace(indo, eng)
-    return text
+    # Bersihkan nilai Amount dan Harga
+    rekening_df['Amount'] = rekening_df['Amount'].astype(str).str.replace('[^0-9]', '', regex=True).astype(float)
+    invoice_df['HARGA'] = pd.to_numeric(invoice_df['HARGA'], errors='coerce')
 
-def safe_strptime(s):
-    try:
-        return datetime.strptime(s, "%d %b %Y")
-    except ValueError:
-        return None
+    # Filter hanya unit E-CHANNEL dan amount > 100jt dari rekening koran
+    echannel_df = rekening_df[(rekening_df['Branch'].str.contains("E-CHANNEL", case=False, na=False)) & (rekening_df['Amount'] > 100_000_000)].copy()
 
-def expand_trx_dates(desc):
-    if pd.isnull(desc):
-        return []
-    match = re.search(r'TRX TGL ([0-9]{2} [A-Z]{3})(?:-([0-9]{2} [A-Z]{3}))? ([0-9]{4})', desc)
-    if match:
-        start_str = translate_bulan(f"{match.group(1)} {match.group(3)}")
-        end_str = start_str
-        if match.group(2):
-            end_str = translate_bulan(f"{match.group(2)} {match.group(3)}")
-        start_date = safe_strptime(start_str)
-        end_date = safe_strptime(end_str)
-        if not start_date or not end_date:
+    # Ekstrak tanggal dari kolom Description berdasarkan pola TRX TGL
+    def extract_trx_tgl(text):
+        match = re.search(r'TRX TGL ([0-9]{1,2} [A-Z]{3}(?:-[0-9]{1,2} [A-Z]{3})? [0-9]{4})', str(text))
+        return match.group(1) if match else None
+
+    echannel_df['Tanggal'] = echannel_df['Description'].apply(extract_trx_tgl)
+
+    # Fungsi bantu konversi teks TGL ke list tanggal
+    def trx_tgl_to_date_range(tgl_str):
+        try:
+            parts = tgl_str.split('-')
+            if len(parts) == 2:
+                start = pd.to_datetime(parts[0] + tgl_str[-5:], format='%d %b %Y')
+                end = pd.to_datetime(parts[1], format='%d %b %Y')
+                return pd.date_range(start, end)
+            else:
+                return [pd.to_datetime(tgl_str, format='%d %b %Y')]
+        except:
             return []
-        return [(start_date + timedelta(days=i)).strftime("%d %b %Y") for i in range((end_date - start_date).days + 1)]
-    return []
 
-if file1 and file2 and start_date and end_date:
-    tanggal_list = pd.date_range(start=start_date, end=end_date)
-    df_output = pd.DataFrame({"Tanggal": tanggal_list.strftime("%d %b %Y").str.upper().str.strip()})
+    # Hitung total invoice sesuai tanggal di kolom Tanggal
+    def sum_invoice_for_trx(tgl_str):
+        total = 0
+        for tgl in trx_tgl_to_date_range(tgl_str):
+            total += invoice_df[invoice_df['TANGGAL INVOICE'].dt.date == tgl.date()]['HARGA'].sum()
+        return total
 
-    df1 = pd.read_excel(file1)
-    df1["Post Date"] = pd.to_datetime(df1["Post Date"], dayfirst=True, errors='coerce')
-    df1 = df1.dropna(subset=["Post Date", "Amount"])
-    df1 = df1[(df1["Branch"].str.contains("UNIT E-CHANNEL", na=False)) & (df1["Amount"] > 100_000_000)].copy()
-    df1["Tanggal TRX List"] = df1["Description"].apply(expand_trx_dates)
+    echannel_df['invoice'] = echannel_df['Tanggal'].apply(sum_invoice_for_trx)
 
-    df2 = pd.read_excel(file2)
-    df2["TANGGAL INVOICE"] = pd.to_datetime(df2["TANGGAL INVOICE"], errors='coerce')
-    df2 = df2.dropna(subset=["TANGGAL INVOICE", "HARGA"])
-    df2["Tanggal"] = df2["TANGGAL INVOICE"].dt.strftime("%d %b %Y").str.upper().str.strip()
-    df2_grouped = df2.groupby("Tanggal")["HARGA"].sum().reset_index()
+    # Hitung selisih
+    echannel_df['selisih'] = echannel_df['invoice'] - echannel_df['Amount']
 
-    df_output["Post Date"] = None
-    df_output["Branch"] = None
-    df_output["Journal No."] = None
-    df_output["Description"] = None
-    df_output["Amount"] = 0
-    df_output["Invoice"] = 0
-    df_output["Selisih"] = 0
-    df_output["Db/Cr"] = None
-    df_output["Balance"] = None
+    # Buat output 10 kolom sesuai spesifikasi
+    final_df = echannel_df[[
+        'Tanggal',
+        'Post Date',
+        'Branch',
+        'Journal No.',
+        'Description',
+        'Amount',
+        'invoice',
+        'selisih',
+        'Db/Cr',
+        'Balance'
+    ]]
 
-    for idx, row in df_output.iterrows():
-        tanggal_row = row["Tanggal"].strip().upper()
-        for _, d1_row in df1.iterrows():
-            if tanggal_row in [t.strip().upper() for t in d1_row["Tanggal TRX List"]]:
-                df_output.at[idx, "Post Date"] = d1_row["Post Date"]
-                df_output.at[idx, "Branch"] = d1_row["Branch"]
-                df_output.at[idx, "Journal No."] = d1_row["Journal No."]
-                df_output.at[idx, "Description"] = d1_row["Description"]
-                df_output.at[idx, "Amount"] = d1_row["Amount"]
-                df_output.at[idx, "Db/Cr"] = d1_row["Db/Cr"]
-                df_output.at[idx, "Balance"] = d1_row["Balance"]
-                break
+    # Tampilkan preview
+    st.subheader("Preview Output (Unit E-Channel > 100jt)")
+    st.dataframe(final_df)
 
-    df_output = pd.merge(df_output, df2_grouped, on="Tanggal", how="left")
-    df_output["Invoice"] = df_output["HARGA"].fillna(0)
-    df_output.drop(columns=["HARGA"], inplace=True)
-    df_output["Selisih"] = df_output["Amount"] - df_output["Invoice"]
-
-    st.write("Jumlah baris final:", len(df_output))
-    st.header("Hasil Compare Detail (10 Kolom)")
-    st.dataframe(df_output.fillna(""))
-
-    import io
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_output.to_excel(writer, index=False, sheet_name='Compare Hasil')
-    output.seek(0)
-
+    # Export to Excel
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        final_df.to_excel(writer, index=False, sheet_name='Compare')
+        writer.save()
     st.download_button(
-        label="Download Hasil Compare (Excel)",
-        data=output,
-        file_name="hasil_compare.xlsx",
+        label="📥 Download Hasil dalam Excel",
+        data=output.getvalue(),
+        file_name="hasil_compare_unit_echannel_100jt.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
-else:
-    st.info("Silakan upload kedua file dan pilih periode untuk melanjutkan.")
